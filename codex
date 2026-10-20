@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve symlinks so configuration follows the physical script.
+SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
+PACKAGES_FILE="$SCRIPT_DIR/.packages"
+PACKAGES=()
+while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%%#*}"
+    read -r -a line_packages <<< "$line"
+    for package in "${line_packages[@]}"; do
+        # Package names become Containerfile shell arguments; reject shell syntax.
+        if [[ ! "$package" =~ ^[a-zA-Z0-9][a-zA-Z0-9+_.:-]*$ ]]; then
+            printf 'Invalid package name in %s: %s\n' "$PACKAGES_FILE" "$package" >&2
+            exit 1
+        fi
+        PACKAGES+=("$package")
+    done
+done < "$PACKAGES_FILE"
+if [[ ${#PACKAGES[@]} -eq 0 ]]; then
+    printf 'No packages listed in %s\n' "$PACKAGES_FILE" >&2
+    exit 1
+fi
+
+IMAGE="${CODEX_PRO_IMAGE:-localhost/codex-pro:latest}"
+CODEX_DATA="${CODEX_PRO_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/codex-pro}"
+BUILD_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/codex-pro"
+
+mkdir -p "$CODEX_DATA/.codex" "$BUILD_DIR"
+chmod 700 "$CODEX_DATA" "$CODEX_DATA/.codex"
+
+read -r -d '' CONTAINERFILE <<'EOF' || true
+FROM registry.opensuse.org/opensuse/tumbleweed:latest
+
+RUN zypper ar -e https://download.opensuse.org/repositories/security:/idm/openSUSE_Tumbleweed/security:idm.repo && \
+    zypper --non-interactive --gpg-auto-import-keys refresh security_idm
+
+RUN zypper --non-interactive refresh && \
+    zypper --non-interactive update && \
+    zypper --non-interactive install --no-recommends \
+        @PACKAGES@ && \
+    zypper clean --all && \
+    cargo install --root /usr/local cargo-deb cargo-generate-rpm
+
+COPY <<'SCRIPT' /usr/local/bin/codex-entrypoint
+#!/bin/sh
+set -eu
+
+export PATH="$HOME/.local/bin:$PATH"
+
+exec codex --yolo "$@"
+SCRIPT
+
+RUN chmod +x /usr/local/bin/codex-entrypoint
+
+ENV HOME=/home/codex
+ENV CODEX_HOME=/home/codex/.codex
+ENV PATH=/home/codex/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/codex-entrypoint"]
+EOF
+
+CONTAINERFILE="${CONTAINERFILE//@PACKAGES@/${PACKAGES[*]}}"
+
+# Rebuild the base image if the Containerfile or configured packages change.
+CF_HASH="$(printf '%s' "$CONTAINERFILE" | sha256sum | awk '{print $1}')"
+
+CURRENT_HASH="$(
+    podman image inspect \
+        --format '{{ index .Labels "io.codex-pro.containerfile-sha" }}' \
+        "$IMAGE" 2>/dev/null || true
+)"
+
+if [[ "$CURRENT_HASH" != "$CF_HASH" ]]; then
+    printf '%s\n' "$CONTAINERFILE" > "$BUILD_DIR/Containerfile"
+
+    echo "Building $IMAGE ..." >&2
+    podman build \
+        --pull=newer \
+        --label "io.codex-pro.containerfile-sha=$CF_HASH" \
+        -t "$IMAGE" \
+        -f "$BUILD_DIR/Containerfile" \
+        "$BUILD_DIR"
+fi
+
+PROJECT_DIR="$(pwd -P)"
+
+RUN_ARGS=(
+    --rm
+    -i
+
+    # Run as the current host user, so files Codex creates in
+    # the repository have the correct ownership.
+    --userns=keep-id
+    --user "$(id -u):$(id -g)"
+
+    # Keep the installed binaries read-only during normal use, while allowing
+    # Codex to update its database, sessions, login, and configuration.
+    --volume "$CODEX_DATA:/home/codex:ro"
+    --volume "$CODEX_DATA/.codex:/home/codex/.codex:rw"
+    --volume "$HOME/.agents/skills:/etc/codex/skills:ro"
+    #--volume /tmp:/tmp:rw
+    --security-opt label=disable
+
+    # Only expose the directory from which codex-pro was launched.
+    --volume "$PROJECT_DIR:/workspace:rw"
+    --workdir /workspace
+
+    --env HOME=/home/codex
+    --env CODEX_HOME=/home/codex/.codex
+    --env PATH=/home/codex/.local/bin:/usr/local/bin:/usr/bin:/bin
+)
+
+# Allocate a terminal only when both input and output are terminals.
+if [[ -t 0 && -t 1 ]]; then
+    RUN_ARGS+=(-t)
+fi
+
+# Support absolute host paths passed by scripts, including --cd.
+if [[ "$PROJECT_DIR" != /workspace ]]; then
+    RUN_ARGS+=(--volume "$PROJECT_DIR:$PROJECT_DIR:rw")
+fi
+
+UPDATE_ARGS=(
+    --rm
+
+    # The update container is deliberately short-lived, but its persistent
+    # home must be writable while Codex and its skills are refreshed.
+    --userns=keep-id
+    --user "$(id -u):$(id -g)"
+    --volume "$CODEX_DATA:/home/codex:rw,z"
+    --workdir /home/codex
+
+    --env HOME=/home/codex
+    --env CODEX_HOME=/home/codex/.codex
+    --env PATH=/home/codex/.local/bin:/usr/local/bin:/usr/bin:/bin
+)
+
+# Pass through proxies if required.
+for var in \
+    HTTP_PROXY HTTPS_PROXY NO_PROXY \
+    http_proxy https_proxy no_proxy
+do
+    if [[ -n "${!var:-}" ]]; then
+        RUN_ARGS+=(--env "$var=${!var}")
+        UPDATE_ARGS+=(--env "$var=${!var}")
+    fi
+done
+
+echo "Updating Codex in persistent home..." >&2
+podman run "${UPDATE_ARGS[@]}" \
+    --entrypoint /bin/sh \
+    "$IMAGE" \
+    -c '
+        set -eu
+        curl -fsSL https://chatgpt.com/codex/install.sh | \
+            CODEX_NON_INTERACTIVE=1 sh >/dev/null
+        npx --yes skills add posit-dev/skills \
+            --skill "*" \
+            --agent codex \
+            --global \
+            --yes >/dev/null
+    '
+
+# Let commits use your normal Git identity without copying the config.
+if [[ -f "$HOME/.gitconfig" ]]; then
+    RUN_ARGS+=(--volume "$HOME/.gitconfig:/home/codex/.gitconfig:ro")
+fi
+
+exec podman run "${RUN_ARGS[@]}" "$IMAGE" "$@"
