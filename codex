@@ -1,36 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Resolve symlinks so configuration follows the physical script.
-SCRIPT_DIR="$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")"
-PACKAGES_FILE="$SCRIPT_DIR/.packages"
-PACKAGES=()
-while IFS= read -r line || [[ -n "$line" ]]; do
-    line="${line%%#*}"
-    read -r -a line_packages <<< "$line"
-    for package in "${line_packages[@]}"; do
-        # Package names become Containerfile shell arguments; reject shell syntax.
-        if [[ ! "$package" =~ ^[a-zA-Z0-9][a-zA-Z0-9+_.:-]*$ ]]; then
-            printf 'Invalid package name in %s: %s\n' "$PACKAGES_FILE" "$package" >&2
-            exit 1
-        fi
-        PACKAGES+=("$package")
-    done
-done < "$PACKAGES_FILE"
-if [[ ${#PACKAGES[@]} -eq 0 ]]; then
-    printf 'No packages listed in %s\n' "$PACKAGES_FILE" >&2
-    exit 1
-fi
+# Configuration follows the physical launcher, even through a symlink.
+SCRIPT_PATH="$(readlink -f -- "${BASH_SOURCE[0]}")"
 
-IMAGE="${CODEX_PRO_IMAGE:-localhost/codex-pro:latest}"
-CODEX_DATA="${CODEX_PRO_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/codex-pro}"
-BUILD_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/codex-pro"
+# Keep Python off stdin so piped prompts and interactive input reach Codex.
+# read returns 1 at EOF because the heredoc contains no NUL delimiter.
+IFS= read -r -d '' CODEX_PYTHON <<'CODEX_PYTHON_EOF' || true
+"""Host-side configuration, file exchange, and lifecycle for the Codex launcher."""
 
-mkdir -p "$CODEX_DATA/.codex" "$BUILD_DIR"
-chmod 700 "$CODEX_DATA" "$CODEX_DATA/.codex"
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
 
-read -r -d '' CONTAINERFILE <<'EOF' || true
-FROM registry.opensuse.org/opensuse/tumbleweed:latest
+
+# The first argument is the physical launcher path supplied by Bash.
+HERE = Path(sys.argv.pop(1)).parent
+
+CONTAINERFILE_TEMPLATE = r"""FROM registry.opensuse.org/opensuse/tumbleweed:latest
 
 RUN zypper ar -e https://download.opensuse.org/repositories/security:/idm/openSUSE_Tumbleweed/security:idm.repo && \
     zypper --non-interactive --gpg-auto-import-keys refresh security_idm
@@ -48,7 +46,9 @@ set -eu
 
 export PATH="$HOME/.local/bin:$PATH"
 
-exec codex --yolo "$@"
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+exec codex --yolo -c 'sqlite_home="/home/codex/.codex"' "$@"
 SCRIPT
 
 RUN chmod +x /usr/local/bin/codex-entrypoint
@@ -60,113 +60,559 @@ ENV PATH=/home/codex/.local/bin:/usr/local/bin:/usr/bin:/bin
 WORKDIR /workspace
 
 ENTRYPOINT ["/usr/local/bin/codex-entrypoint"]
-EOF
+"""
+CONTAINER_HOME = "/home/codex"
+SQLITE_HOME = CONTAINER_HOME + "/.codex"
+EXCHANGE = "/codex-exchange"
 
-CONTAINERFILE="${CONTAINERFILE//@PACKAGES@/${PACKAGES[*]}}"
 
-# Rebuild the base image if the Containerfile or configured packages change.
-CF_HASH="$(printf '%s' "$CONTAINERFILE" | sha256sum | awk '{print $1}')"
+class Error(Exception):
+    pass
 
-CURRENT_HASH="$(
-    podman image inspect \
-        --format '{{ index .Labels "io.codex-pro.containerfile-sha" }}' \
-        "$IMAGE" 2>/dev/null || true
-)"
 
-if [[ "$CURRENT_HASH" != "$CF_HASH" ]]; then
-    printf '%s\n' "$CONTAINERFILE" > "$BUILD_DIR/Containerfile"
+class Cancelled(BaseException):
+    def __init__(self, signum):
+        self.signum = signum
 
-    echo "Building $IMAGE ..." >&2
-    podman build \
-        --pull=newer \
-        --label "io.codex-pro.containerfile-sha=$CF_HASH" \
-        -t "$IMAGE" \
-        -f "$BUILD_DIR/Containerfile" \
-        "$BUILD_DIR"
-fi
 
-PROJECT_DIR="$(pwd -P)"
+def private_dir(path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir() or path.stat().st_uid != os.getuid():
+        raise Error(f"Not a private owned directory: {path}")
+    path.chmod(0o700)
+    return path
 
-RUN_ARGS=(
-    --rm
-    -i
 
-    # Run as the current host user, so files Codex creates in
-    # the repository have the correct ownership.
-    --userns=keep-id
-    --user "$(id -u):$(id -g)"
+def absolute(value, label):
+    path = Path(value)
+    if not path.is_absolute():
+        raise Error(f"{label} must be absolute: {value}")
+    return path
 
-    # Keep the installed binaries read-only during normal use, while allowing
-    # Codex to update its database, sessions, login, and configuration.
-    --volume "$CODEX_DATA:/home/codex:ro"
-    --volume "$CODEX_DATA/.codex:/home/codex/.codex:rw"
-    --volume "$HOME/.agents/skills:/etc/codex/skills:ro"
-    #--volume /tmp:/tmp:rw
-    --security-opt label=disable
 
-    # Only expose the directory from which codex-pro was launched.
-    --volume "$PROJECT_DIR:/workspace:rw"
-    --workdir /workspace
+def inside(path, parent):
+    return path == parent or parent in path.parents
 
-    --env HOME=/home/codex
-    --env CODEX_HOME=/home/codex/.codex
-    --env PATH=/home/codex/.local/bin:/usr/local/bin:/usr/bin:/bin
-)
 
-# Allocate a terminal only when both input and output are terminals.
-if [[ -t 0 && -t 1 ]]; then
-    RUN_ARGS+=(-t)
-fi
+def command_name(args):
+    """Skip global options with operands before finding the CLI subcommand."""
+    operands = {"-c", "--config", "-m", "--model", "-p", "--profile", "-C", "--cd",
+                "-s", "--sandbox", "-a", "--ask-for-approval", "--local-provider",
+                "--enable", "--disable", "-i", "--image", "--add-dir", "--remote",
+                "--remote-auth-token-env"}
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            return ""
+        if not arg.startswith("-"):
+            return arg
+        index += 2 if arg in operands else 1
+    return ""
 
-# Support absolute host paths passed by scripts, including --cd.
-if [[ "$PROJECT_DIR" != /workspace ]]; then
-    RUN_ARGS+=(--volume "$PROJECT_DIR:$PROJECT_DIR:rw")
-fi
 
-UPDATE_ARGS=(
-    --rm
+def option_value(args, names):
+    result = None
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in names:
+            if index + 1 == len(args):
+                raise Error(f"Missing value for {arg}")
+            result = args[index + 1]
+            index += 2
+            continue
+        for name in names:
+            if arg.startswith(name + "="):
+                result = arg[len(name) + 1:]
+        index += 1
+    return result
 
-    # The update container is deliberately short-lived, but its persistent
-    # home must be writable while Codex and its skills are refreshed.
-    --userns=keep-id
-    --user "$(id -u):$(id -g)"
-    --volume "$CODEX_DATA:/home/codex:rw,z"
-    --workdir /home/codex
 
-    --env HOME=/home/codex
-    --env CODEX_HOME=/home/codex/.codex
-    --env PATH=/home/codex/.local/bin:/usr/local/bin:/usr/bin:/bin
-)
+def check_sqlite_overrides(args):
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        value = None
+        if arg in ("-c", "--config") and index + 1 < len(args):
+            index += 1
+            value = args[index]
+        elif arg.startswith("--config="):
+            value = arg.partition("=")[2]
+        elif arg.startswith("-c") and len(arg) > 2:
+            value = arg[2:]
+        if value and value.partition("=")[0].strip().strip("\"'") == "sqlite_home":
+            raise Error("sqlite_home is managed by the wrapper; remove its CLI override")
+        index += 1
 
-# Pass through proxies if required.
-for var in \
-    HTTP_PROXY HTTPS_PROXY NO_PROXY \
-    http_proxy https_proxy no_proxy
-do
-    if [[ -n "${!var:-}" ]]; then
-        RUN_ARGS+=(--env "$var=${!var}")
-        UPDATE_ARGS+=(--env "$var=${!var}")
-    fi
-done
 
-echo "Updating Codex in persistent home..." >&2
-podman run "${UPDATE_ARGS[@]}" \
-    --entrypoint /bin/sh \
-    "$IMAGE" \
-    -c '
-        set -eu
-        curl -fsSL https://chatgpt.com/codex/install.sh | \
-            CODEX_NON_INTERACTIVE=1 sh >/dev/null
-        npx --yes skills add posit-dev/skills \
-            --skill "*" \
-            --agent codex \
-            --global \
-            --yes >/dev/null
-    '
+def packages(config):
+    result = []
+    for line in config.read_text().splitlines():
+        for item in line.partition("#")[0].split():
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9+_.:-]*", item):
+                raise Error(f"Invalid package name in {config}: {item}")
+            result.append(item)
+    if not result:
+        raise Error(f"No packages listed in {config}")
+    return result
 
-# Let commits use your normal Git identity without copying the config.
-if [[ -f "$HOME/.gitconfig" ]]; then
-    RUN_ARGS+=(--volume "$HOME/.gitconfig:/home/codex/.gitconfig:ro")
-fi
 
-exec podman run "${RUN_ARGS[@]}" "$IMAGE" "$@"
+class FileRules:
+    def __init__(self, data, cache, project, home):
+        self.state_roots = [data, cache, home / ".codex"]
+        self.home = home
+        self.project = project
+
+    def validate(self, source, directory=False):
+        # The final component must not be a symlink; ancestors are canonicalized.
+        if source.is_symlink():
+            raise Error(f"Symlink mount sources are not allowed: {source}")
+        source = source.resolve(strict=True)
+        for root in self.state_roots:
+            if inside(source, root) or (directory and inside(root, source)):
+                raise Error(f"Mount would expose wrapper/Codex state: {source}")
+        forbidden = [Path(p) for p in ("/proc", "/sys", "/dev", "/run", "/var/run")]
+        if any(inside(source, p.resolve()) for p in forbidden):
+            raise Error(f"Runtime/system mounts are not allowed: {source}")
+        if directory:
+            roots = [Path("/"), self.home, Path("/tmp"), Path("/var/tmp")]
+            if any(source == p.resolve() or inside(p.resolve(), source) for p in roots):
+                raise Error(f"Broad directory mount is not allowed: {source}")
+            if any(inside(source, p.resolve()) for p in (Path("/tmp"), Path("/var/tmp"))):
+                raise Error(f"Temporary directories cannot be mounted: {source}")
+        reserved = [Path("/workspace"), Path(CONTAINER_HOME), Path("/etc/codex/skills"),
+                    Path("/tmp/codex-runtime"), Path(EXCHANGE), self.project]
+        if any(inside(source, p) or inside(p, source) for p in reserved):
+            raise Error(f"Mount conflicts with a managed destination: {source}")
+        return source
+
+    def read(self, config):
+        """Return (mode, canonical source, snapshot) rules, without mounting parents."""
+        result = {}
+        if not config.exists():
+            return []
+        for number, line in enumerate(config.read_text().splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            fields = line.split("\t")
+            mode = fields[0]
+            try:
+                if mode in ("ro", "rw") and len(fields) == 2:
+                    source = absolute(fields[1], "Mount source")
+                    info = source.lstat()
+                    if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                        raise Error(f"Expected regular file or directory: {source}")
+                    source = self.validate(source, stat.S_ISDIR(info.st_mode))
+                    matches = [(mode, source, False)]
+                elif mode == "ro-regex" and len(fields) == 3:
+                    directory = absolute(fields[1], "Regex directory")
+                    if directory.is_symlink():
+                        raise Error(f"Regex directory cannot be a symlink: {directory}")
+                    directory = directory.resolve(strict=True)
+                    # This directory is enumerated, never mounted. File validation below
+                    # permits /tmp inputs but still excludes runtime and state files.
+                    expression = re.compile(fields[2])
+                    matches = []
+                    for source in sorted(directory.iterdir()):
+                        if not expression.fullmatch(source.name):
+                            continue
+                        info = source.lstat()
+                        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+                            raise Error(f"Regex matched a non-regular or unowned file: {source}")
+                        source = self.validate(source)
+                        matches.append(("ro", source, True))
+                else:
+                    raise Error("Expected tab-separated ro/path, rw/path, or ro-regex/directory/expression")
+                for access, source, snapshot in matches:
+                    if source in result and result[source][0] != access:
+                        raise Error(f"Conflicting access modes for {source}")
+                    # If either rule asks for a snapshot, keep the safer snapshot.
+                    previous = result.get(source, (access, source, False))
+                    result[source] = (access, source, snapshot or previous[2])
+            except (OSError, ValueError, re.error, Error) as error:
+                raise Error(f"{config}:{number}: {error}") from error
+        paths = list(result)
+        for index, path in enumerate(paths):
+            if any(inside(path, other) or inside(other, path) for other in paths[index + 1:]):
+                raise Error(f"Overlapping .files destinations: {path}")
+        return list(result.values())
+
+
+def snapshot(source, target):
+    descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "rb") as original:
+        info = os.fstat(original.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise Error(f"Input is no longer an owned regular file: {source}")
+        with target.open("xb") as copied:
+            while block := original.read(1024 * 1024):
+                copied.write(block)
+    target.chmod(0o400)
+
+
+class Output:
+    def __init__(self, args, project):
+        self.args = list(args)
+        self.descriptor = None
+        self.path = None
+        value = option_value(args, ("--output-last-message", "-o"))
+        if value is None:
+            return
+        if not value:
+            raise Error("Output path must not be empty")
+        cwd = option_value(args, ("--cd", "-C")) or str(project)
+        cwd = Path(cwd)
+        if inside(cwd, Path("/workspace")):
+            cwd = project / cwd.relative_to("/workspace")
+        elif not cwd.is_absolute():
+            cwd = project / cwd
+        self.path = Path(value)
+        if not self.path.is_absolute():
+            self.path = cwd / self.path
+        self.path = self.path.parent.resolve(strict=True) / self.path.name
+        # Opening before the run pins the destination inode: no late symlink
+        # substitution, and a timeout cannot recreate an unlinked caller file.
+        self.descriptor = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW |
+                                  os.O_NONBLOCK, 0o600)
+        info = os.fstat(self.descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            self.close()
+            raise Error(f"Output must be an owned regular file: {self.path}")
+        index = 0
+        while index < len(self.args):
+            arg = self.args[index]
+            if arg == "--":
+                break
+            if arg in ("--output-last-message", "-o"):
+                self.args[index + 1] = EXCHANGE + "/result.txt"
+                index += 2
+                continue
+            for name in ("--output-last-message", "-o"):
+                if arg.startswith(name + "="):
+                    self.args[index] = name + "=" + EXCHANGE + "/result.txt"
+            index += 1
+
+    def copy_back(self, result):
+        if self.descriptor is None:
+            return
+        if not result.is_file() or result.is_symlink() or not result.stat().st_size:
+            raise Error("Codex succeeded without writing its final output file")
+        # The container must be gone before trusting this file for host-side IO.
+        with result.open("rb") as source:
+            os.ftruncate(self.descriptor, 0)
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+            while block := source.read(1024 * 1024):
+                view = memoryview(block)
+                while view:
+                    count = os.write(self.descriptor, view)
+                    view = view[count:]
+            os.fsync(self.descriptor)
+
+    def close(self):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+class Runner:
+    def __init__(self, journal, exchange):
+        self.process = None
+        self.containers = []
+        self.journal = journal
+        self.exchange = exchange
+
+    def save(self):
+        # Write before creation, so even losing BOTH supervisor processes leaves
+        # a recovery record identifying this invocation's containers.
+        if self.containers:
+            temporary = self.journal.with_suffix(".tmp")
+            temporary.write_text(json.dumps({"containers": self.containers,
+                                            "exchange": str(self.exchange)}) + "\n")
+            temporary.chmod(0o600)
+            temporary.replace(self.journal)
+        else:
+            self.journal.unlink(missing_ok=True)
+
+    def call(self, args, capture=False, interactive=False, check=True):
+        # Do not let cancellation land between spawning a client and retaining
+        # its handle. Restoring the mask delivers any pending cancellation.
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK,
+                                          {signal.SIGINT, signal.SIGTERM, signal.SIGHUP})
+        try:
+            self.process = subprocess.Popen(
+                args, stdin=None if interactive else subprocess.DEVNULL,
+                stdout=subprocess.PIPE if capture else (None if interactive else sys.stderr),
+                stderr=None, text=capture, start_new_session=not interactive,
+                # Python restores ordinary signal dispositions, but not a blocked
+                # mask. Unblock in the single-threaded child's pre-exec phase.
+                preexec_fn=lambda: signal.pthread_sigmask(signal.SIG_SETMASK, previous),
+            )
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+        try:
+            if capture:
+                output, _ = self.process.communicate()
+            else:
+                self.process.wait()
+                output = ""
+            code = self.process.returncode
+        except BaseException:
+            self.stop_process()
+            raise
+        finally:
+            self.process = None
+        if check and code:
+            raise Error(f"{args[0]} {args[1]} failed (exit {code})")
+        return code, output.strip() if capture else output
+
+    def stop_process(self):
+        if self.process is not None and self.process.poll() is None:
+            # Build/update clients have their own process group. The interactive
+            # client retains the terminal's group, so signal that client alone.
+            if os.getpgid(self.process.pid) == self.process.pid:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            else:
+                self.process.terminate()
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                if os.getpgid(self.process.pid) == self.process.pid:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                else:
+                    self.process.kill()
+                self.process.wait()
+
+    def container(self, options, image, args, interactive=False):
+        name = "codex-pro-" + uuid.uuid4().hex
+        self.containers.append(name)
+        self.save()
+        role = "exec" if interactive else "update"
+        options = [*options, "--label", "io.codex-pro.role=" + role]
+        self.call(["podman", "create", "--name", name, *options, image, *args], capture=True)
+        start = ["podman", "start", "--attach"]
+        if interactive:
+            start.append("--interactive")
+        code, _ = self.call([*start, name], interactive=interactive, check=False)
+        self.remove(name)
+        return code
+
+    def remove(self, name):
+        result = subprocess.run(["podman", "rm", "--force", "--ignore", name],
+                                stdin=subprocess.DEVNULL, stdout=sys.stderr,
+                                timeout=15, check=False)
+        if result.returncode:
+            raise Error(f"Could not remove container {name}; manual cleanup required")
+        self.containers.remove(name)
+        self.save()
+
+    def cleanup(self):
+        self.stop_process()
+        for name in list(self.containers):
+            self.remove(name)
+
+
+def mount(source, target, mode):
+    # --volume cannot represent colons in host paths. Fail instead of silently
+    # interpreting a pathname as additional mount options.
+    if any(character in str(path) for path in (source, target) for character in (":", "\n")):
+        raise Error(f"Unsupported bind-mount pathname: {source}")
+    return ["--volume", f"{source}:{target}:{mode}"]
+
+
+def lock(path):
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    fcntl.flock(descriptor, fcntl.LOCK_EX)
+    return descriptor
+
+
+def environment():
+    values = {"HOME": CONTAINER_HOME, "CODEX_HOME": SQLITE_HOME,
+              "CODEX_SQLITE_HOME": SQLITE_HOME, "TMPDIR": "/tmp",
+              "XDG_RUNTIME_DIR": "/tmp/codex-runtime",
+              "PATH": CONTAINER_HOME + "/.local/bin:/usr/local/bin:/usr/bin:/bin"}
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        if name in os.environ:
+            values[name] = os.environ[name]
+    return [arg for name, value in values.items() for arg in ("--env", f"{name}={value}")]
+
+
+def build_image(runner, cache, image):
+    descriptor = lock(cache / "build.lock")
+    try:
+        content = CONTAINERFILE_TEMPLATE.replace(
+            "@PACKAGES@", " ".join(packages(HERE / ".packages")))
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        code, info = runner.call(["podman", "image", "inspect", "--format",
+                                  '{{ index .Labels "io.codex-pro.containerfile-sha" }}|{{.Id}}',
+                                  image], capture=True, check=False)
+        if code or not info.startswith(digest + "|"):
+            (cache / "Containerfile").write_text(content)
+            print(f"Building {image} ...", file=sys.stderr)
+            runner.call(["podman", "build", "--pull=newer", "--label",
+                         "io.codex-pro.containerfile-sha=" + digest, "-t", image,
+                         "-f", str(cache / "Containerfile"), str(cache)])
+            _, info = runner.call(["podman", "image", "inspect", "--format",
+                                   '{{ index .Labels "io.codex-pro.containerfile-sha" }}|{{.Id}}',
+                                   image], capture=True)
+        image_id = info.partition("|")[2]
+        if not image_id:
+            raise Error("Podman did not return the built image ID")
+        return image_id
+    finally:
+        os.close(descriptor)
+
+
+def execute(args):
+    home = Path.home().resolve()
+    project = Path.cwd().resolve()
+    if project in {Path("/"), home, Path("/tmp").resolve(), Path("/var/tmp").resolve(),
+                   Path("/run").resolve()}:
+        raise Error("Launch from a checkout directory, not a broad home, root, or runtime directory")
+    data = absolute(os.environ.get("CODEX_PRO_HOME", str(Path(os.environ.get(
+        "XDG_DATA_HOME", str(home / ".local/share"))) / "codex-pro")), "CODEX_PRO_HOME").resolve()
+    cache = absolute(os.environ.get("XDG_CACHE_HOME", str(home / ".cache")),
+                     "XDG_CACHE_HOME").resolve() / "codex-pro"
+    if any(inside(root, project) or inside(project, root) for root in (data, cache)):
+        raise Error("Launch checkout must not contain or be inside wrapper state/cache storage")
+    check_sqlite_overrides(args)
+    custom = FileRules(data, cache, project, home).read(HERE / ".files")
+    project_id = hashlib.sha256(os.fsencode(project)).hexdigest()
+    private_dir(data)
+    private_dir(data / ".codex")
+    private_dir(cache)
+    state_id = hashlib.sha256(os.fsencode(data)).hexdigest()
+    parent = private_dir(cache / "state" / state_id)
+    pending = parent / f"{uuid.uuid4().hex}.cleanup-pending.json"
+    stage_path = Path(tempfile.mkdtemp(prefix="codex-pro-"))
+    output_dir = private_dir(stage_path / "output")
+    output = None
+    runner = Runner(pending, stage_path)
+    cleanup_ok = False
+    try:
+        output = Output(args, project) if command_name(args) in ("exec", "e") else Output([], project)
+        if output.path in [item[1] for item in custom]:
+            raise Error("Output destination conflicts with a .files input mount")
+        mounts = []
+        for index, (access, source, copy) in enumerate(custom):
+            actual = source
+            if copy:
+                actual = stage_path / f"input-{index}"
+                snapshot(source, actual)
+            mounts += mount(actual, source, access)
+        common = ["--userns=keep-id", "--user", f"{os.getuid()}:{os.getgid()}",
+                  "--label", "io.codex-pro.project=" + project_id,
+                  "--pid=private", "--ipc=private", "--network=private",
+                  "--security-opt", "label=disable",
+                  "--tmpfs", "/tmp:rw,exec,nosuid,nodev,mode=1777",
+                  "--tmpfs", "/var/tmp:rw,exec,nosuid,nodev,mode=1777",
+                  "--tmpfs", "/run:rw,nosuid,nodev,mode=755",
+                  *mount(data, CONTAINER_HOME, "rw"), *environment()]
+        image = build_image(runner, cache, os.environ.get("CODEX_PRO_IMAGE", "localhost/codex-pro:latest"))
+        print("Updating Codex in persistent home ...", file=sys.stderr)
+        update = '''set -eu
+mkdir -p "$XDG_RUNTIME_DIR"
+chmod 700 "$XDG_RUNTIME_DIR"
+curl -fsSL https://chatgpt.com/codex/install.sh | CODEX_NON_INTERACTIVE=1 sh >/dev/null
+npx --yes skills add posit-dev/skills --skill "*" --agent codex --global --yes >/dev/null
+'''
+        code = runner.container([*common, "--workdir", CONTAINER_HOME,
+                                 "--entrypoint", "/bin/sh"], image, ["-c", update])
+        if code:
+            return code
+        run_options = [*common, "-i", *mount(project, "/workspace", "rw"),
+                       "--workdir", "/workspace", *mounts]
+        if project != Path("/workspace"):
+            run_options += mount(project, project, "rw")
+        if sys.stdin.isatty() and sys.stdout.isatty():
+            run_options.append("-t")
+        skills = home / ".agents/skills"
+        if skills.is_dir():
+            run_options += mount(skills.resolve(), "/etc/codex/skills", "ro")
+        if (home / ".gitconfig").is_file():
+            run_options += mount((home / ".gitconfig").resolve(), CONTAINER_HOME + "/.gitconfig", "ro")
+        if output.descriptor is not None:
+            run_options += mount(output_dir, EXCHANGE, "rw")
+        code = runner.container(run_options, image, output.args if output.descriptor is not None
+                                else args, interactive=True)
+        if not code:
+            output.copy_back(output_dir / "result.txt")
+        return code
+    finally:
+        # Repeated signals must not interrupt container removal.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        try:
+            runner.cleanup()
+            cleanup_ok = True
+        except (Error, OSError, subprocess.TimeoutExpired) as error:
+            # Preserve this invocation's recovery details for manual cleanup.
+            runner.save()
+            print(f"Cleanup failed: {error}. Recovery record: {pending}", file=sys.stderr)
+            raise Error("Container cleanup failed; manual recovery required") from error
+        finally:
+            if output is not None:
+                output.close()
+            if cleanup_ok:
+                shutil.rmtree(stage_path)
+
+
+def worker(parent):
+    def cancel(signum, _frame):
+        for item in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(item, signal.SIG_IGN)
+        raise Cancelled(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, cancel)
+    # Linux parent-death notification also covers SIGKILL from subprocess.run's
+    # timeout. Check getppid afterward to close the fork/prctl race.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG) failed")
+    if os.getppid() != parent:
+        return 128 + signal.SIGTERM
+    try:
+        return execute(sys.argv[1:])
+    except Cancelled as error:
+        return 128 + error.signum
+    except (Error, OSError, ValueError) as error:
+        print(f"codex-container: {error}", file=sys.stderr)
+        return 1
+
+
+def main():
+    parent = os.getpid()
+    child = os.fork()
+    if child == 0:
+        try:
+            code = worker(parent)
+        except BaseException as error:
+            print(f"codex-container: {error}", file=sys.stderr)
+            code = 1
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code if code >= 0 else 128 - code)
+
+    def forward(signum, _frame):
+        try:
+            os.kill(child, signum)
+        except ProcessLookupError:
+            pass
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        signal.signal(signum, forward)
+    _, status = os.waitpid(child, 0)
+    code = os.waitstatus_to_exitcode(status)
+    return code if code >= 0 else 128 - code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+CODEX_PYTHON_EOF
+exec python3 -c "$CODEX_PYTHON" "$SCRIPT_PATH" "$@"

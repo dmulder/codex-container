@@ -1,0 +1,12 @@
+# Copy this file to .files beside the physical codex launcher.
+# Fields are separated by literal TAB characters. Paths must be absolute.
+# No shell expansion: $HOME, ~, and globs are not expanded.
+#
+# ro<TAB>/absolute/reference-file-or-directory
+# rw<TAB>/absolute/writable-file-or-directory
+# ro-regex<TAB>/absolute/directory<TAB>filename-regex
+#
+# Opt-in compatibility with Himmelblau PR #1880's vet helper:
+# This exposes snapshots of ALL matching files, including concurrent reviews.
+# Uncomment the next line to enable it. It contains actual tab separators.
+#ro-regex	/tmp	tmp[^/]+\.diff
